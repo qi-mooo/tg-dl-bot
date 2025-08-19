@@ -1,0 +1,5 @@
+aiogram
+telethon
+fastapi
+uvicorn
+python-multipart

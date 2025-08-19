@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  tgdlbot:
+    build: .
+    container_name: tgdlbot
+    environment:
+      - API_ID=611335
+      - API_HASH=d524b414d21f4d37f08684c1df41ac9c
+      - BOT_TOKEN=
+      - USER_SESSION=/app/session/userbot.session
+      - DEFAULT_DOWNLOAD_DIR=/download
+      - TGDLBOT_DB=/app/sql/tgdlbot.db
+    volumes:
+      - ./session:/app/session
+      - ./download:/download
+      - ./sql:/app/sql
+    ports:
+      - "8500:8000"
+    restart: unless-stopped
