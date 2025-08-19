@@ -1911,8 +1911,8 @@ async def handle_download_callback(callback_query: types.CallbackQuery, data: st
                 await callback_query.answer("❌ 您只能操作自己的下载任务", show_alert=True)
                 return
             
-            await callback_query.answer("�  开始续传下载...")
-            await callback_query.message.edit_text("� 正在在续传下载，请稍候...")
+            await callback_query.answer("📥 开始续传下载...")
+            await callback_query.message.edit_text("📥 正在在续传下载，请稍候...")
             
             # 获取下载状态
             chat_title = await get_chat_info(chat_id)
