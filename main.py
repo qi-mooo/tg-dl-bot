@@ -3,6 +3,7 @@ import asyncio
 import re
 import time
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from telethon import TelegramClient, events
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 from fastapi import FastAPI, Request, Form
@@ -27,6 +28,18 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 userbot = TelegramClient(USER_SESSION, API_ID, API_HASH)
 app = FastAPI()
+
+# ====== 内联键盘工具函数 ======
+def create_download_control_keyboard(task_id: str) -> InlineKeyboardMarkup:
+    """创建下载控制内联键盘"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⏸️ 暂停", callback_data=f"pause_{task_id}"),
+            InlineKeyboardButton(text="▶️ 继续", callback_data=f"resume_{task_id}"),
+            InlineKeyboardButton(text="❌ 取消", callback_data=f"cancel_{task_id}")
+        ]
+    ])
+    return keyboard
 
 # ====== 错误处理和输入验证工具函数 ======
 def safe_database_operation(operation_func):
@@ -405,6 +418,7 @@ class DownloadManager:
         task_id = self.generate_task_id()
         task = DownloadTask(task_id, chat_id, message_id, file_name, user_id)
         self.active_tasks[task_id] = task
+        print(f"✅ 任务添加成功: {file_name} (ID: {task_id}) - 用户: {user_id}")
         return task_id
     
     def get_task(self, task_id: str) -> DownloadTask:
@@ -1092,11 +1106,12 @@ async def handle_link(message: types.Message):
         await message.reply('未找到消息')
         return
     
-    # 如果是相册消息，使用相册下载
+    # 发送任务添加成功提示
     if msg.grouped_id:
+        await message.reply(f"✅ 相册下载任务已添加到队列\n🔗 链接: {link}\n📊 正在获取相册信息...")
         files = await download_album(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
     else:
-        # 如果不是相册，直接下载单个文件
+        await message.reply(f"✅ 文件下载任务已添加到队列\n🔗 链接: {link}\n📁 正在获取文件信息...")
         files = await download_single_file(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
     
     if isinstance(files, list) and files and not any('失败' in str(f) for f in files):
@@ -1126,23 +1141,31 @@ async def handle_file(message: types.Message):
     file_id = None
     if message.document:
         file_id = message.document.file_id
-        file_name = message.document.file_name or f"file_{file_id}"
+        original_name = message.document.file_name or f"file_{file_id}"
+        file_name = f"{message.message_id}_{original_name}"
     elif message.photo:
         file_id = message.photo[-1].file_id
-        file_name = f"photo_{file_id}.jpg"
+        file_name = f"{message.message_id}_photo_{file_id}.jpg"
     elif message.video:
         file_id = message.video.file_id
-        file_name = message.video.file_name or f"video_{file_id}.mp4"
+        original_name = message.video.file_name or f"video_{file_id}.mp4"
+        file_name = f"{message.message_id}_{original_name}"
     elif message.audio:
         file_id = message.audio.file_id
-        file_name = message.audio.file_name or f"audio_{file_id}.mp3"
+        original_name = message.audio.file_name or f"audio_{file_id}.mp3"
+        file_name = f"{message.message_id}_{original_name}"
     
     if file_id:
         # 创建下载任务
         task_id = download_manager.add_task(message.chat.id, message.message_id, file_name, user_id)
         task = download_manager.get_task(task_id)
         
-        sent_msg = await message.reply(f"⏬ 正在通过 userbot 下载: {file_name} (ID: {task_id})")
+        # 发送任务添加成功提示
+        await message.reply(f"✅ 下载任务已添加到队列\n📁 文件名: {file_name}\n🆔 任务ID: {task_id}")
+        sent_msg = await message.reply(
+            f"⏬ 正在通过 userbot 下载: {file_name} (ID: {task_id})",
+            reply_markup=create_download_control_keyboard(task_id)
+        )
         start_time = time.time()
         last_bytes = [0]
         last_update = time.time()
@@ -1181,7 +1204,12 @@ async def handle_file(message: types.Message):
             # 每 refresh_interval 秒更新一次
             if now - last_update >= refresh_interval or current == total_bytes:
                 try:
-                    await bot.edit_message_text(chat_id=sent_msg.chat.id, message_id=sent_msg.message_id, text=text)
+                    await bot.edit_message_text(
+                        chat_id=sent_msg.chat.id, 
+                        message_id=sent_msg.message_id, 
+                        text=text,
+                        reply_markup=create_download_control_keyboard(task_id)
+                    )
                     last_update = now
                     last_bytes[0] = current
                 except Exception:
@@ -1337,6 +1365,86 @@ body { background: #f7f7f7; font-family: Arial, sans-serif; }
         return RedirectResponse(url="/", status_code=302)
     except Exception as e:
         return style + f'<div class="login-box">登录失败: {e}</div>'
+
+# ====== 回调查询处理器 ======
+@dp.callback_query()
+async def handle_callback_query(callback_query: types.CallbackQuery):
+    """处理内联键盘回调"""
+    try:
+        user_id = callback_query.from_user.id
+        data = callback_query.data
+        
+        # 权限检查：管理员和授权用户都可以使用
+        if not (is_admin(user_id) or is_authorized_user(user_id)):
+            await callback_query.answer("❌ 您没有权限使用此功能", show_alert=True)
+            return
+        
+        # 解析回调数据
+        if "_" not in data:
+            await callback_query.answer("❌ 无效的操作", show_alert=True)
+            return
+        
+        action, task_id = data.split("_", 1)
+        task = download_manager.get_task(task_id)
+        
+        if not task:
+            await callback_query.answer("❌ 任务不存在或已完成", show_alert=True)
+            return
+        
+        # 检查权限：只能操作自己的任务，管理员可以操作所有任务
+        if not is_admin(user_id) and task.user_id != user_id:
+            await callback_query.answer("❌ 您只能操作自己的下载任务", show_alert=True)
+            return
+        
+        # 执行操作
+        if action == "pause":
+            if download_manager.pause_task(task_id):
+                await callback_query.answer(f"⏸️ 已暂停: {task.file_name}")
+                # 更新消息文本，保持按钮
+                try:
+                    new_text = callback_query.message.text.replace("⏬", "⏸️")
+                    await callback_query.message.edit_text(
+                        text=new_text,
+                        reply_markup=create_download_control_keyboard(task_id)
+                    )
+                except Exception:
+                    pass
+            else:
+                await callback_query.answer("❌ 无法暂停此任务")
+        
+        elif action == "resume":
+            if download_manager.resume_task(task_id):
+                await callback_query.answer(f"▶️ 已恢复: {task.file_name}")
+                # 更新消息文本，保持按钮
+                try:
+                    new_text = callback_query.message.text.replace("⏸️", "⏬")
+                    await callback_query.message.edit_text(
+                        text=new_text,
+                        reply_markup=create_download_control_keyboard(task_id)
+                    )
+                except Exception:
+                    pass
+            else:
+                await callback_query.answer("❌ 无法恢复此任务")
+        
+        elif action == "cancel":
+            if download_manager.cancel_task(task_id):
+                await callback_query.answer(f"❌ 已取消: {task.file_name}")
+                # 更新消息文本，移除按钮
+                try:
+                    new_text = f"❌ 下载已取消: {task.file_name}"
+                    await callback_query.message.edit_text(text=new_text)
+                except Exception:
+                    pass
+            else:
+                await callback_query.answer("❌ 无法取消此任务")
+        
+        else:
+            await callback_query.answer("❌ 未知操作")
+    
+    except Exception as e:
+        print(f"[callback_query] error: {e}")
+        await callback_query.answer("❌ 操作失败，请稍后重试")
 
 # ====== 权限入口处理器，必须放在最后 ======
 @dp.message()
@@ -1529,7 +1637,8 @@ async def download_single_file(chat_id, msg_id, download_path=None, progress_cal
     saved_files = []
     refresh_interval = get_refresh_interval()
     
-    filename = msg.file.name if hasattr(msg, 'file') and msg.file and msg.file.name else f"file_{msg.id}"
+    original_filename = msg.file.name if hasattr(msg, 'file') and msg.file and msg.file.name else f"file_{msg.id}"
+    filename = f"{msg.id}_{original_filename}"
     
     # 创建下载任务
     task_id = download_manager.add_task(chat_id, msg.id, filename, user_id or 0)
@@ -1575,13 +1684,19 @@ async def download_single_file(chat_id, msg_id, download_path=None, progress_cal
         if not sent_msg:
             sent_msg = await bot.send_message(
                 bot_chat_id,
-                f"⏬ 正在下载 {filename}: 0% | 0.00MB/{total_bytes/1024/1024:.2f}MB (ID: {task_id})"
+                f"⏬ 正在下载 {filename}: 0% | 0.00MB/{total_bytes/1024/1024:.2f}MB (ID: {task_id})",
+                reply_markup=create_download_control_keyboard(task_id)
             )
             last_update = now
             last_bytes[0] = current
         elif now - last_update >= refresh_interval or current == total_bytes:
             try:
-                await bot.edit_message_text(chat_id=sent_msg.chat.id, message_id=sent_msg.message_id, text=text)
+                await bot.edit_message_text(
+                    chat_id=sent_msg.chat.id, 
+                    message_id=sent_msg.message_id, 
+                    text=text,
+                    reply_markup=create_download_control_keyboard(task_id)
+                )
                 last_update = now
                 last_bytes[0] = current
             except Exception as e:
@@ -1638,7 +1753,8 @@ async def download_album(chat_id, msg_id, download_path=None, progress_callback=
     
     async def download_one_with_task_control(idx, m):
         if isinstance(m.media, (MessageMediaDocument, MessageMediaPhoto)):
-            filename = m.file.name if hasattr(m, 'file') and m.file and m.file.name else f"file_{idx}"
+            original_filename = m.file.name if hasattr(m, 'file') and m.file and m.file.name else f"file_{idx}"
+            filename = f"{m.id}_{original_filename}"
             
             # 创建下载任务
             task_id = download_manager.add_task(chat_id, m.id, filename, user_id or 0)
@@ -1684,13 +1800,19 @@ async def download_album(chat_id, msg_id, download_path=None, progress_callback=
                 if not sent_msg:
                     sent_msg = await bot.send_message(
                         bot_chat_id,
-                        f"⏬ 正在下载 {filename}: 0% | 0.00MB/{total_bytes/1024/1024:.2f}MB (ID: {task_id})"
+                        f"⏬ 正在下载 {filename}: 0% | 0.00MB/{total_bytes/1024/1024:.2f}MB (ID: {task_id})",
+                        reply_markup=create_download_control_keyboard(task_id)
                     )
                     last_update = now
                     last_bytes[0] = current
                 elif now - last_update >= refresh_interval or current == total_bytes:
                     try:
-                        await bot.edit_message_text(chat_id=sent_msg.chat.id, message_id=sent_msg.message_id, text=text)
+                        await bot.edit_message_text(
+                            chat_id=sent_msg.chat.id, 
+                            message_id=sent_msg.message_id, 
+                            text=text,
+                            reply_markup=create_download_control_keyboard(task_id)
+                        )
                         last_update = now
                         last_bytes[0] = current
                     except Exception as e:
