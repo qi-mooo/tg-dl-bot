@@ -48,7 +48,7 @@ def create_file_check_keyboard(chat_id, msg_id: int, user_id: int) -> InlineKeyb
     """创建文件检查结果键盘"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="� 下续传下载", callback_data=f"download_missing_{chat_id}_{msg_id}_{user_id}"),
+            InlineKeyboardButton(text="📥 下续传下载", callback_data=f"download_missing_{chat_id}_{msg_id}_{user_id}"),
             InlineKeyboardButton(text="🔄 强制重下全部", callback_data=f"force_download_all_{chat_id}_{msg_id}_{user_id}")
         ]
     ])
