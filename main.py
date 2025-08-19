@@ -702,7 +702,7 @@ BASIC_USER_HELP_TEMPLATE = """🤖 Telegram 下载机器人帮助
 • /pause [任务ID] - 暂停下载（不指定ID则暂停所有）
 • /resume [任务ID] - 恢复下载（不指定ID则恢复所有）
 • /cancel [任务ID] - 取消下载（不指定ID则取消所有）
-• /check <链接> - 🆕 检查文件下载状态和断点续传
+• /check <链接> - 检查文件下载状态和断点续传
 
 💡 使用提示：
 • 所有下载均通过 userbot 进行
