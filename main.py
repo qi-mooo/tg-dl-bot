@@ -37,6 +37,19 @@ def create_download_control_keyboard(task_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⏸️ 暂停", callback_data=f"pause_{task_id}"),
             InlineKeyboardButton(text="▶️ 继续", callback_data=f"resume_{task_id}"),
             InlineKeyboardButton(text="❌ 取消", callback_data=f"cancel_{task_id}")
+        ],
+        [
+            InlineKeyboardButton(text="🔄 强制重下", callback_data=f"force_redownload_{task_id}")
+        ]
+    ])
+    return keyboard
+
+def create_file_check_keyboard(chat_id: int, msg_id: int, user_id: int) -> InlineKeyboardMarkup:
+    """创建文件检查结果键盘"""
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📥 下载缺失文件", callback_data=f"download_missing_{chat_id}_{msg_id}_{user_id}"),
+            InlineKeyboardButton(text="🔄 强制重下全部", callback_data=f"force_download_all_{chat_id}_{msg_id}_{user_id}")
         ]
     ])
     return keyboard
@@ -108,6 +121,8 @@ def init_db():
     c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('max_concurrent_downloads', '3'))
     # 默认进度刷新间隔为1秒
     c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('refresh_interval', '1'))
+    # 文件分类开关，默认关闭
+    c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('file_classification', '0'))
     # 管理员和允许用户
     c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('admin_ids', ''))
     c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('allowed_user_ids', ''))
@@ -203,12 +218,302 @@ def set_refresh_interval(value):
     """设置进度刷新间隔"""
     set_setting('refresh_interval', str(value))
 
+def get_file_classification():
+    """获取文件分类开关状态"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT value FROM settings WHERE key=?', ('file_classification',))
+        row = c.fetchone()
+        conn.close()
+        return bool(int(row[0])) if row else False
+    except Exception:
+        return False
+
+@safe_database_operation
+def set_file_classification(enabled):
+    """设置文件分类开关"""
+    set_setting('file_classification', '1' if enabled else '0')
+
 @safe_database_operation
 def reset_settings_to_default():
     """重置系统设置为默认值，保留用户权限设置"""
     set_setting('max_concurrent_downloads', '3')
     set_setting('refresh_interval', '1')
+    set_setting('file_classification', '0')
     # 不重置 admin_ids 和 allowed_user_ids
+
+# ====== 文件分类工具函数 ======
+def get_file_category(file_name: str) -> str:
+    """根据文件扩展名获取文件分类"""
+    if not file_name:
+        return "其他"
+    
+    # 获取文件扩展名（转为小写）
+    ext = pathlib.Path(file_name).suffix.lower()
+    
+    # 图片类型
+    image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.tif'}
+    if ext in image_exts:
+        return "图片"
+    
+    # 视频类型
+    video_exts = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.ts', '.m2ts'}
+    if ext in video_exts:
+        return "视频"
+    
+    # 音频类型
+    audio_exts = {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a', '.opus'}
+    if ext in audio_exts:
+        return "音频"
+    
+    # 文档类型
+    document_exts = {'.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.rtf', '.odt', '.ods', '.odp'}
+    if ext in document_exts:
+        return "文档"
+    
+    # 压缩包类型
+    archive_exts = {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tar.gz', '.tar.bz2', '.tar.xz'}
+    if ext in archive_exts:
+        return "压缩包"
+    
+    # 程序/代码类型
+    code_exts = {'.py', '.js', '.html', '.css', '.java', '.cpp', '.c', '.h', '.php', '.rb', '.go', '.rs', '.swift'}
+    if ext in code_exts:
+        return "代码"
+    
+    # 其他类型
+    return "其他"
+
+def get_download_path(chat_title: str, file_name: str, use_classification: bool = None) -> str:
+    """
+    获取文件下载路径
+    
+    Args:
+        chat_title: 频道/群组名称，如果无法解析则为 None
+        file_name: 文件名
+        use_classification: 是否使用分类，None 时从设置中获取
+    
+    Returns:
+        完整的文件下载路径
+    """
+    if use_classification is None:
+        use_classification = get_file_classification()
+    
+    base_dir = DEFAULT_DOWNLOAD_DIR
+    
+    # 如果无法解析来源，保存到 /download/save
+    if not chat_title:
+        if use_classification:
+            category = get_file_category(file_name)
+            return os.path.join(base_dir, "save", category, file_name)
+        else:
+            return os.path.join(base_dir, "save", file_name)
+    
+    # 清理频道名称，移除不合法的文件名字符
+    safe_chat_title = re.sub(r'[<>:"/\\|?*]', '_', chat_title)
+    
+    # 如果启用分类
+    if use_classification:
+        category = get_file_category(file_name)
+        return os.path.join(base_dir, safe_chat_title, category, file_name)
+    else:
+        return os.path.join(base_dir, safe_chat_title, file_name)
+
+# ====== 文件检查和断点续传工具函数 ======
+def check_file_exists(file_path: str) -> tuple[bool, int]:
+    """
+    检查文件是否存在及其大小
+    
+    Returns:
+        (是否存在, 文件大小)
+    """
+    try:
+        if os.path.exists(file_path):
+            return True, os.path.getsize(file_path)
+        return False, 0
+    except Exception:
+        return False, 0
+
+async def get_message_files_info(chat_id: int, msg_id: int) -> list[dict]:
+    """
+    获取消息中所有文件的信息
+    
+    Returns:
+        文件信息列表，每个元素包含：{
+            'message_id': int,
+            'file_name': str,
+            'file_size': int,
+            'is_album': bool
+        }
+    """
+    await ensure_userbot()
+    files_info = []
+    
+    try:
+        msg = await userbot.get_messages(chat_id, ids=msg_id)
+        if not msg:
+            return files_info
+        
+        # 检查是否是相册
+        if msg.grouped_id:
+            # 获取相册中的所有消息
+            all_msgs = await userbot.get_messages(chat_id, limit=50, min_id=msg.id-25, max_id=msg.id+25)
+            album = [m for m in all_msgs if getattr(m, 'grouped_id', None) == msg.grouped_id]
+            album.sort(key=lambda m: m.id)
+            
+            for idx, m in enumerate(album):
+                if isinstance(m.media, (MessageMediaDocument, MessageMediaPhoto)):
+                    original_filename = m.file.name if hasattr(m, 'file') and m.file and m.file.name else f"file_{idx}"
+                    filename = f"{m.id}_{original_filename}"
+                    file_size = m.file.size if hasattr(m, 'file') and m.file else 0
+                    
+                    files_info.append({
+                        'message_id': m.id,
+                        'file_name': filename,
+                        'file_size': file_size,
+                        'is_album': True
+                    })
+        else:
+            # 单个文件
+            if isinstance(msg.media, (MessageMediaDocument, MessageMediaPhoto)):
+                original_filename = msg.file.name if hasattr(msg, 'file') and msg.file and msg.file.name else f"file_{msg.id}"
+                filename = f"{msg.id}_{original_filename}"
+                file_size = msg.file.size if hasattr(msg, 'file') and msg.file else 0
+                
+                files_info.append({
+                    'message_id': msg.id,
+                    'file_name': filename,
+                    'file_size': file_size,
+                    'is_album': False
+                })
+    
+    except Exception as e:
+        print(f"[get_message_files_info] error: {e}")
+    
+    return files_info
+
+async def check_download_status(chat_id: int, msg_id: int, chat_title: str = None) -> dict:
+    """
+    检查下载状态
+    
+    Returns:
+        {
+            'total_files': int,
+            'downloaded_files': int,
+            'missing_files': list,
+            'existing_files': list,
+            'total_size': int,
+            'downloaded_size': int
+        }
+    """
+    if not chat_title:
+        chat_title = await get_chat_info(chat_id)
+    
+    files_info = await get_message_files_info(chat_id, msg_id)
+    
+    result = {
+        'total_files': len(files_info),
+        'downloaded_files': 0,
+        'missing_files': [],
+        'existing_files': [],
+        'total_size': 0,
+        'downloaded_size': 0
+    }
+    
+    for file_info in files_info:
+        file_path = get_download_path(chat_title, file_info['file_name'])
+        exists, local_size = check_file_exists(file_path)
+        
+        result['total_size'] += file_info['file_size']
+        
+        if exists and local_size == file_info['file_size']:
+            # 文件完整存在
+            result['downloaded_files'] += 1
+            result['downloaded_size'] += local_size
+            result['existing_files'].append({
+                **file_info,
+                'local_path': file_path,
+                'local_size': local_size,
+                'status': 'complete'
+            })
+        elif exists and local_size > 0:
+            # 文件部分下载
+            result['missing_files'].append({
+                **file_info,
+                'local_path': file_path,
+                'local_size': local_size,
+                'status': 'partial'
+            })
+        else:
+            # 文件不存在
+            result['missing_files'].append({
+                **file_info,
+                'local_path': file_path,
+                'local_size': 0,
+                'status': 'missing'
+            })
+    
+    return result
+
+def format_download_status_message(status: dict, chat_title: str = None) -> str:
+    """格式化下载状态消息"""
+    total_files = status['total_files']
+    downloaded_files = status['downloaded_files']
+    missing_count = len(status['missing_files'])
+    
+    # 计算大小
+    total_size_mb = status['total_size'] / (1024 * 1024)
+    downloaded_size_mb = status['downloaded_size'] / (1024 * 1024)
+    
+    # 计算进度百分比
+    progress_percent = int((downloaded_files / total_files * 100)) if total_files > 0 else 0
+    size_percent = int((status['downloaded_size'] / status['total_size'] * 100)) if status['total_size'] > 0 else 0
+    
+    message = f"📊 下载状态检查结果\n\n"
+    
+    if chat_title:
+        message += f"📂 来源: {chat_title}\n"
+    
+    message += f"📁 文件统计:\n"
+    message += f"• 总文件数: {total_files}\n"
+    message += f"• 已下载: {downloaded_files} ({progress_percent}%)\n"
+    message += f"• 待下载: {missing_count}\n\n"
+    
+    message += f"💾 大小统计:\n"
+    message += f"• 总大小: {total_size_mb:.2f} MB\n"
+    message += f"• 已下载: {downloaded_size_mb:.2f} MB ({size_percent}%)\n"
+    message += f"• 待下载: {(total_size_mb - downloaded_size_mb):.2f} MB\n\n"
+    
+    if downloaded_files == total_files:
+        message += "✅ 所有文件已完整下载！"
+    elif missing_count > 0:
+        message += f"⚠️ 发现 {missing_count} 个文件需要下载\n\n"
+        
+        # 显示部分缺失文件的详情
+        partial_files = [f for f in status['missing_files'] if f['status'] == 'partial']
+        missing_files = [f for f in status['missing_files'] if f['status'] == 'missing']
+        
+        if partial_files:
+            message += f"🔄 部分下载的文件 ({len(partial_files)}):\n"
+            for f in partial_files[:3]:  # 最多显示3个
+                local_mb = f['local_size'] / (1024 * 1024)
+                total_mb = f['file_size'] / (1024 * 1024)
+                percent = int((f['local_size'] / f['file_size'] * 100)) if f['file_size'] > 0 else 0
+                message += f"• {f['file_name']}: {local_mb:.1f}/{total_mb:.1f}MB ({percent}%)\n"
+            if len(partial_files) > 3:
+                message += f"... 还有 {len(partial_files) - 3} 个文件\n"
+            message += "\n"
+        
+        if missing_files:
+            message += f"❌ 未下载的文件 ({len(missing_files)}):\n"
+            for f in missing_files[:3]:  # 最多显示3个
+                size_mb = f['file_size'] / (1024 * 1024)
+                message += f"• {f['file_name']}: {size_mb:.1f}MB\n"
+            if len(missing_files) > 3:
+                message += f"... 还有 {len(missing_files) - 3} 个文件\n"
+    
+    return message
 
 # ====== 权限检查工具函数 ======
 def is_admin(user_id: int) -> bool:
@@ -284,6 +589,7 @@ ADMIN_HELP_TEMPLATE = """🔧 管理员专用帮助
 /settings - 查看当前系统设置
 /setmax <数量> - 设置最大同时下载数
 /setrefresh <秒数> - 设置进度刷新间隔
+/classification <on/off> - 开启/关闭文件分类存储
 /resetsettings - 重置所有设置为默认值
 
 📁 下载管理命令：
@@ -297,19 +603,25 @@ ADMIN_HELP_TEMPLATE = """🔧 管理员专用帮助
 - 所有管理员命令都需要管理员权限
 - 用户ID可以通过转发用户消息获取
 - 设置修改会立即生效
-- 管理员可以操作所有用户的下载任务"""
+- 管理员可以操作所有用户的下载任务
+- 文件分类功能：图片、视频、音频、文档、压缩包、代码、其他"""
 
 SETTINGS_DISPLAY_TEMPLATE = """⚙️ 当前系统设置
 
 📊 下载设置：
 • 最大并发下载数：{max_concurrent}
 • 进度刷新间隔：{refresh_interval} 秒
+• 文件分类存储：{classification_status}
 
 👥 用户权限：
 • 管理员数量：{admin_count}
 • 授权用户数量：{user_count}
 
-📋 详细用户列表请使用 /listusers 查看"""
+📋 详细用户列表请使用 /listusers 查看
+
+💡 文件分类说明：
+• 开启后文件将按类型分类存储（图片、视频、音频、文档、压缩包、代码、其他）
+• 无法解析来源的文件将保存到 /download/save 目录"""
 
 USER_LIST_TEMPLATE = """👥 用户权限列表
 
@@ -342,11 +654,13 @@ BASIC_USER_HELP_TEMPLATE = """🤖 Telegram 下载机器人帮助
 • /pause [任务ID] - 暂停下载（不指定ID则暂停所有）
 • /resume [任务ID] - 恢复下载（不指定ID则恢复所有）
 • /cancel [任务ID] - 取消下载（不指定ID则取消所有）
+• /check <链接> - 🆕 检查文件下载状态和断点续传
 
 💡 使用提示：
 • 所有下载均通过 userbot 进行
 • 下载的文件会按来源分类保存
-• 任务ID可通过 /downloads 命令获取"""
+• 任务ID可通过 /downloads 命令获取
+• 发送链接时会自动检查文件状态"""
 
 # ====== 设置显示格式化函数 ======
 def format_settings_display() -> str:
@@ -354,12 +668,16 @@ def format_settings_display() -> str:
     try:
         max_concurrent = get_max_concurrent_downloads()
         refresh_interval = get_refresh_interval()
+        classification_enabled = get_file_classification()
         admin_ids = get_admin_ids()
         allowed_user_ids = get_allowed_user_ids()
+        
+        classification_status = "✅ 已开启" if classification_enabled else "❌ 已关闭"
         
         return SETTINGS_DISPLAY_TEMPLATE.format(
             max_concurrent=max_concurrent,
             refresh_interval=refresh_interval,
+            classification_status=classification_status,
             admin_count=len(admin_ids),
             user_count=len(allowed_user_ids)
         )
@@ -717,6 +1035,92 @@ async def cmd_list_users(message: types.Message):
         error_msg = format_error_message("获取用户列表", e)
         await message.reply(error_msg)
 
+async def cmd_classification(message: types.Message):
+    """处理/classification命令，设置文件分类开关"""
+    try:
+        user_id = message.from_user.id
+        
+        # 权限检查：只允许管理员使用
+        if not is_admin(user_id):
+            await message.reply("❌ 此命令仅限管理员使用。")
+            return
+        
+        # 验证命令参数
+        is_valid, args, error_msg = validate_command_args(
+            message.text, 1, "/classification", "/classification <on/off>"
+        )
+        if not is_valid:
+            await message.reply(error_msg)
+            return
+        
+        setting_value = args[1].strip().lower()
+        
+        if setting_value == "on":
+            set_file_classification(True)
+            await message.reply("✅ 文件分类存储已开启\n\n📁 文件将按类型分类存储：\n• 图片、视频、音频、文档、压缩包、代码、其他\n• 无法解析来源的文件将保存到 /download/save 目录")
+        elif setting_value == "off":
+            set_file_classification(False)
+            await message.reply("❌ 文件分类存储已关闭\n\n📁 文件将直接保存到频道/群组目录中")
+        else:
+            await message.reply("❌ 参数错误，请使用 on 或 off\n\n💡 示例：\n• /classification on - 开启分类\n• /classification off - 关闭分类")
+        
+    except Exception as e:
+        error_msg = format_error_message("设置文件分类", e)
+        await message.reply(error_msg)
+
+async def cmd_check_download(message: types.Message):
+    """处理/check命令，检查指定链接的下载状态"""
+    try:
+        user_id = message.from_user.id
+        
+        # 权限检查：管理员和授权用户都可以使用
+        if not (is_admin(user_id) or is_authorized_user(user_id)):
+            await message.reply("❌ 您没有权限使用此命令。")
+            return
+        
+        # 验证命令参数
+        is_valid, args, error_msg = validate_command_args(
+            message.text, 1, "/check", "/check <Telegram链接>"
+        )
+        if not is_valid:
+            await message.reply(error_msg)
+            return
+        
+        link = args[1].strip()
+        chat_id, msg_id = parse_telegram_link(link)
+        
+        if not chat_id or not msg_id:
+            await message.reply('❌ 请提供有效的 Telegram 消息链接。\n\n💡 示例：\n• https://t.me/channel/123\n• https://t.me/c/123456/789')
+            return
+        
+        # 检查文件下载状态
+        status_msg = await message.reply("🔍 正在检查文件下载状态...")
+        
+        try:
+            chat_title = await get_chat_info(chat_id)
+            download_status = await check_download_status(chat_id, msg_id, chat_title)
+            
+            if download_status['total_files'] == 0:
+                await status_msg.edit_text("❌ 消息中没有可下载的文件")
+                return
+            
+            # 格式化状态消息
+            status_text = format_download_status_message(download_status, chat_title)
+            
+            # 添加操作按钮
+            await status_msg.edit_text(
+                status_text,
+                reply_markup=create_file_check_keyboard(chat_id, msg_id, user_id)
+            )
+        
+        except Exception as e:
+            await status_msg.edit_text(f"❌ 检查文件状态时出错: {str(e)}")
+            print(f"[cmd_check_download] error: {e}")
+    
+    except Exception as e:
+        error_msg = format_error_message("检查下载状态", e)
+        await message.reply(error_msg)
+
 async def cmd_reset_settings(message: types.Message):
     """处理/resetsettings命令，重置系统设置为默认值"""
     try:
@@ -736,6 +1140,7 @@ async def cmd_reset_settings(message: types.Message):
         
         # 获取重置后的设置值
         new_refresh_interval = get_refresh_interval()
+        new_classification = get_file_classification()
         
         # 显示重置成功确认和新设置值
         reset_confirmation = f"""✅ 系统设置已重置为默认值
@@ -743,6 +1148,7 @@ async def cmd_reset_settings(message: types.Message):
 📊 重置后的设置：
 • 最大并发下载数：{new_max_concurrent}
 • 进度刷新间隔：{new_refresh_interval} 秒
+• 文件分类存储：{'✅ 已开启' if new_classification else '❌ 已关闭'}
 
 💡 注意：用户权限设置已保留，未受影响。"""
         
@@ -1106,37 +1512,66 @@ async def handle_link(message: types.Message):
         await message.reply('未找到消息')
         return
     
-    # 发送任务添加成功提示
-    if msg.grouped_id:
-        await message.reply(f"✅ 相册下载任务已添加到队列\n🔗 链接: {link}\n📊 正在获取相册信息...")
-        files = await download_album(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
-    else:
-        await message.reply(f"✅ 文件下载任务已添加到队列\n🔗 链接: {link}\n📁 正在获取文件信息...")
-        files = await download_single_file(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
+    # 检查文件下载状态
+    status_msg = await message.reply("🔍 正在检查文件下载状态...")
     
-    if isinstance(files, list) and files and not any('失败' in str(f) for f in files):
-        await message.reply(f'下载完成: {files}')
-    else:
-        await message.reply(f'下载失败: {files if files else "未知错误"}')
+    try:
+        chat_title = await get_chat_info(chat_id)
+        download_status = await check_download_status(chat_id, msg_id, chat_title)
+        
+        if download_status['total_files'] == 0:
+            await status_msg.edit_text("❌ 消息中没有可下载的文件")
+            return
+        
+        # 格式化状态消息
+        status_text = format_download_status_message(download_status, chat_title)
+        
+        if download_status['downloaded_files'] == download_status['total_files']:
+            # 所有文件已下载完成
+            await status_msg.edit_text(
+                status_text,
+                reply_markup=create_file_check_keyboard(chat_id, msg_id, user_id)
+            )
+        elif len(download_status['missing_files']) > 0:
+            # 有文件需要下载
+            await status_msg.edit_text(
+                status_text,
+                reply_markup=create_file_check_keyboard(chat_id, msg_id, user_id)
+            )
+        else:
+            # 开始下载
+            await status_msg.edit_text("📥 开始下载...")
+            
+            if msg.grouped_id:
+                files = await download_album(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
+            else:
+                files = await download_single_file(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
+            
+            if isinstance(files, list) and files and not any('失败' in str(f) for f in files):
+                await message.reply(f'✅ 下载完成: {len(files)} 个文件')
+            else:
+                await message.reply(f'❌ 下载失败: {files if files else "未知错误"}')
+    
+    except Exception as e:
+        await status_msg.edit_text(f"❌ 检查文件状态时出错: {str(e)}")
+        print(f"[handle_link] error: {e}")
 
 async def handle_file(message: types.Message):
     await ensure_userbot()
     user_id = message.from_user.id
     
     # 解析转发来源
-    src_id = None
-    if message.forward_from:
-        src_id = f"user_{message.forward_from.id}"
-    elif message.forward_from_chat:
-        src_id = f"chat_{message.forward_from_chat.id}"
-    else:
-        src_id = "unknown"
-    # 目标文件夹
-    folder = os.path.join(DEFAULT_DOWNLOAD_DIR, src_id)
-    os.makedirs(folder, exist_ok=True)
-    # 保存来源id到txt
-    with open(os.path.join(folder, "source_id.txt"), "w") as f:
-        f.write(str(src_id))
+    chat_title = None
+    if message.forward_from_chat:
+        # 从频道/群组转发
+        chat_title = message.forward_from_chat.title
+    elif message.forward_from:
+        # 从用户转发，使用用户名或ID作为"频道名"
+        if message.forward_from.username:
+            chat_title = f"@{message.forward_from.username}"
+        else:
+            chat_title = f"User_{message.forward_from.id}"
+    # 如果无法解析来源，chat_title 保持为 None，将保存到 /download/save
     # 用 userbot 下载 telegram 文件
     file_id = None
     if message.document:
@@ -1156,6 +1591,24 @@ async def handle_file(message: types.Message):
         file_name = f"{message.message_id}_{original_name}"
     
     if file_id:
+        # 使用新的路径生成逻辑
+        file_path = get_download_path(chat_title, file_name)
+        folder = os.path.dirname(file_path)
+        os.makedirs(folder, exist_ok=True)
+        
+        # 保存来源信息到txt文件
+        source_info = {
+            "chat_title": chat_title or "未知来源",
+            "forward_from_chat": message.forward_from_chat.title if message.forward_from_chat else None,
+            "forward_from_user": message.forward_from.username if message.forward_from else None,
+            "message_id": message.message_id,
+            "file_name": file_name
+        }
+        
+        source_file_path = os.path.join(folder, "source_info.txt")
+        with open(source_file_path, "a", encoding="utf-8") as f:
+            f.write(f"{source_info}\n")
+        
         # 创建下载任务
         task_id = download_manager.add_task(message.chat.id, message.message_id, file_name, user_id)
         task = download_manager.get_task(task_id)
@@ -1366,6 +1819,125 @@ body { background: #f7f7f7; font-family: Arial, sans-serif; }
     except Exception as e:
         return style + f'<div class="login-box">登录失败: {e}</div>'
 
+# ====== 回调处理辅助函数 ======
+async def handle_download_callback(callback_query: types.CallbackQuery, data: str, user_id: int):
+    """处理下载相关的回调"""
+    try:
+        if data.startswith("download_missing_"):
+            # 解析参数: download_missing_{chat_id}_{msg_id}_{user_id}
+            parts = data.split("_")
+            if len(parts) != 5:
+                await callback_query.answer("❌ 参数错误", show_alert=True)
+                return
+            
+            chat_id = int(parts[2])
+            msg_id = int(parts[3])
+            original_user_id = int(parts[4])
+            
+            # 权限检查
+            if not is_admin(user_id) and user_id != original_user_id:
+                await callback_query.answer("❌ 您只能操作自己的下载任务", show_alert=True)
+                return
+            
+            await callback_query.answer("📥 开始下载缺失文件...")
+            await callback_query.message.edit_text("📥 正在下载缺失的文件，请稍候...")
+            
+            # 获取下载状态
+            chat_title = await get_chat_info(chat_id)
+            download_status = await check_download_status(chat_id, msg_id, chat_title)
+            
+            if len(download_status['missing_files']) == 0:
+                await callback_query.message.edit_text("✅ 所有文件已完整下载！")
+                return
+            
+            # 下载缺失的文件
+            success_count = 0
+            total_missing = len(download_status['missing_files'])
+            
+            # 检查是否是相册
+            await ensure_userbot()
+            msg = await userbot.get_messages(chat_id, ids=msg_id)
+            
+            if msg and msg.grouped_id:
+                # 相册下载
+                files = await download_album(
+                    chat_id, msg_id, 
+                    bot_chat_id=callback_query.message.chat.id, 
+                    user_id=user_id,
+                    skip_existing=True
+                )
+            else:
+                # 单文件下载
+                files = await download_single_file(
+                    chat_id, msg_id,
+                    bot_chat_id=callback_query.message.chat.id,
+                    user_id=user_id,
+                    skip_existing=True
+                )
+            
+            # 重新检查状态
+            final_status = await check_download_status(chat_id, msg_id, chat_title)
+            final_missing = len(final_status['missing_files'])
+            downloaded_count = total_missing - final_missing
+            
+            if final_missing == 0:
+                await callback_query.message.edit_text(f"✅ 下载完成！成功下载 {downloaded_count} 个文件")
+            else:
+                await callback_query.message.edit_text(
+                    f"⚠️ 部分下载完成\n✅ 成功: {downloaded_count} 个文件\n❌ 失败: {final_missing} 个文件"
+                )
+        
+        elif data.startswith("force_download_all_"):
+            # 解析参数: force_download_all_{chat_id}_{msg_id}_{user_id}
+            parts = data.split("_")
+            if len(parts) != 6:
+                await callback_query.answer("❌ 参数错误", show_alert=True)
+                return
+            
+            chat_id = int(parts[3])
+            msg_id = int(parts[4])
+            original_user_id = int(parts[5])
+            
+            # 权限检查
+            if not is_admin(user_id) and user_id != original_user_id:
+                await callback_query.answer("❌ 您只能操作自己的下载任务", show_alert=True)
+                return
+            
+            await callback_query.answer("🔄 开始强制重新下载所有文件...")
+            await callback_query.message.edit_text("🔄 正在强制重新下载所有文件，请稍候...")
+            
+            # 检查是否是相册
+            await ensure_userbot()
+            msg = await userbot.get_messages(chat_id, ids=msg_id)
+            
+            if msg and msg.grouped_id:
+                # 相册下载
+                files = await download_album(
+                    chat_id, msg_id,
+                    bot_chat_id=callback_query.message.chat.id,
+                    user_id=user_id,
+                    force_redownload=True,
+                    skip_existing=False
+                )
+            else:
+                # 单文件下载
+                files = await download_single_file(
+                    chat_id, msg_id,
+                    bot_chat_id=callback_query.message.chat.id,
+                    user_id=user_id,
+                    force_redownload=True,
+                    skip_existing=False
+                )
+            
+            if isinstance(files, list) and files and not any('失败' in str(f) for f in files):
+                await callback_query.message.edit_text(f"✅ 强制重新下载完成！共 {len(files)} 个文件")
+            else:
+                await callback_query.message.edit_text(f"❌ 强制重新下载失败: {files if files else '未知错误'}")
+    
+    except Exception as e:
+        print(f"[handle_download_callback] error: {e}")
+        await callback_query.message.edit_text(f"❌ 操作失败: {str(e)}")
+
 # ====== 回调查询处理器 ======
 @dp.callback_query()
 async def handle_callback_query(callback_query: types.CallbackQuery):
@@ -1382,6 +1954,46 @@ async def handle_callback_query(callback_query: types.CallbackQuery):
         # 解析回调数据
         if "_" not in data:
             await callback_query.answer("❌ 无效的操作", show_alert=True)
+            return
+        
+        # 处理文件检查相关的回调
+        if data.startswith("download_missing_") or data.startswith("force_download_all_"):
+            await handle_download_callback(callback_query, data, user_id)
+            return
+        
+        # 处理强制重下载回调
+        if data.startswith("force_redownload_"):
+            task_id = data.replace("force_redownload_", "")
+            task = download_manager.get_task(task_id)
+            
+            if not task:
+                await callback_query.answer("❌ 任务不存在或已完成", show_alert=True)
+                return
+            
+            # 检查权限
+            if not is_admin(user_id) and task.user_id != user_id:
+                await callback_query.answer("❌ 您只能操作自己的下载任务", show_alert=True)
+                return
+            
+            # 强制重新下载
+            await callback_query.answer("🔄 开始强制重新下载...")
+            try:
+                # 取消当前任务
+                download_manager.cancel_task(task_id)
+                
+                # 重新开始下载
+                if task.chat_id and task.message_id:
+                    files = await download_single_file(
+                        task.chat_id, 
+                        task.message_id, 
+                        bot_chat_id=callback_query.message.chat.id, 
+                        user_id=user_id,
+                        force_redownload=True,
+                        skip_existing=False
+                    )
+                    await callback_query.message.edit_text(f"🔄 强制重下载完成: {task.file_name}")
+            except Exception as e:
+                await callback_query.message.edit_text(f"❌ 强制重下载失败: {str(e)}")
             return
         
         action, task_id = data.split("_", 1)
@@ -1562,6 +2174,12 @@ async def handle_all(message: types.Message):
         if message.text.startswith("/setrefresh "):
             await set_refresh_cmd(message)
             return
+        if message.text.startswith("/classification "):
+            await cmd_classification(message)
+            return
+        if message.text.startswith("/check "):
+            await cmd_check_download(message)
+            return
         # 下载控制命令
         if message.text == "/downloads":
             await cmd_list_downloads(message)
@@ -1614,15 +2232,33 @@ async def ensure_userbot():
         raise Exception("Userbot 未登录，请先在 Web 登录 userbot")
 
 async def get_chat_folder(chat_id):
+    """获取频道/群组的基础文件夹路径（兼容旧版本）"""
     await ensure_userbot()
-    entity = await userbot.get_entity(chat_id)
-    name = entity.title if hasattr(entity, 'title') else str(chat_id)
-    safe_name = re.sub(r'[^-\uFFFF\w\u4e00-\u9fa5\-]', '_', name)
-    folder = os.path.join(DEFAULT_DOWNLOAD_DIR, safe_name)
+    try:
+        entity = await userbot.get_entity(chat_id)
+        name = entity.title if hasattr(entity, 'title') else str(chat_id)
+    except Exception:
+        name = None
+    
+    if name:
+        safe_name = re.sub(r'[^-\uFFFF\w\u4e00-\u9fa5\-]', '_', name)
+        folder = os.path.join(DEFAULT_DOWNLOAD_DIR, safe_name)
+    else:
+        folder = os.path.join(DEFAULT_DOWNLOAD_DIR, "save")
+    
     os.makedirs(folder, exist_ok=True)
     return folder
 
-async def download_single_file(chat_id, msg_id, download_path=None, progress_callback=None, bot_chat_id=None, user_id=None):
+async def get_chat_info(chat_id):
+    """获取频道/群组信息"""
+    await ensure_userbot()
+    try:
+        entity = await userbot.get_entity(chat_id)
+        return entity.title if hasattr(entity, 'title') else None
+    except Exception:
+        return None
+
+async def download_single_file(chat_id, msg_id, download_path=None, progress_callback=None, bot_chat_id=None, user_id=None, force_redownload=False, skip_existing=True):
     """下载单个文件（非相册）"""
     await ensure_userbot()
     msg = await userbot.get_messages(chat_id, ids=msg_id)
@@ -1633,12 +2269,40 @@ async def download_single_file(chat_id, msg_id, download_path=None, progress_cal
     if not isinstance(msg.media, (MessageMediaDocument, MessageMediaPhoto)):
         return ['消息不包含可下载的文件']
     
-    folder = download_path or await get_chat_folder(chat_id)
-    saved_files = []
-    refresh_interval = get_refresh_interval()
-    
+    # 获取文件名和大小
     original_filename = msg.file.name if hasattr(msg, 'file') and msg.file and msg.file.name else f"file_{msg.id}"
     filename = f"{msg.id}_{original_filename}"
+    expected_size = msg.file.size if hasattr(msg, 'file') and msg.file else 0
+    
+    # 使用新的路径生成逻辑
+    if download_path:
+        # 如果指定了下载路径，直接使用
+        folder = download_path
+        os.makedirs(folder, exist_ok=True)
+        full_file_path = os.path.join(folder, filename)
+    else:
+        # 获取频道信息并生成路径
+        chat_title = await get_chat_info(chat_id)
+        full_file_path = get_download_path(chat_title, filename)
+        folder = os.path.dirname(full_file_path)
+        os.makedirs(folder, exist_ok=True)
+    
+    # 检查文件是否已存在且完整
+    file_exists, local_size = check_file_exists(full_file_path)
+    
+    if file_exists and local_size == expected_size and skip_existing and not force_redownload:
+        # 文件已完整下载，跳过
+        return [f'✅ 文件已存在且完整，跳过下载: {filename}']
+    
+    if file_exists and not force_redownload:
+        # 文件存在但可能不完整，提示用户
+        if local_size < expected_size:
+            return [f'⚠️ 文件部分下载 ({local_size}/{expected_size} bytes)，使用强制重下载完整文件: {filename}']
+        elif local_size > expected_size:
+            return [f'⚠️ 本地文件大小异常 ({local_size}/{expected_size} bytes)，建议强制重下: {filename}']
+    
+    saved_files = []
+    refresh_interval = get_refresh_interval()
     
     # 创建下载任务
     task_id = download_manager.add_task(chat_id, msg.id, filename, user_id or 0)
@@ -1735,7 +2399,7 @@ async def download_single_file(chat_id, msg_id, download_path=None, progress_cal
     
     return saved_files
 
-async def download_album(chat_id, msg_id, download_path=None, progress_callback=None, bot_chat_id=None, user_id=None):
+async def download_album(chat_id, msg_id, download_path=None, progress_callback=None, bot_chat_id=None, user_id=None, force_redownload=False, skip_existing=True):
     await ensure_userbot()
     msg = await userbot.get_messages(chat_id, ids=msg_id)
     if not msg:
@@ -1746,8 +2410,12 @@ async def download_album(chat_id, msg_id, download_path=None, progress_callback=
     all_msgs = await userbot.get_messages(chat_id, limit=50, min_id=msg.id-25, max_id=msg.id+25)
     album = [m for m in all_msgs if getattr(m, 'grouped_id', None) == msg.grouped_id]
     album.sort(key=lambda m: m.id)
-    folder = download_path or await get_chat_folder(chat_id)
+    
+    # 获取频道信息用于路径生成
+    chat_title = await get_chat_info(chat_id) if not download_path else None
+    
     saved_files = []
+    skipped_files = []
     total = len(album)
     refresh_interval = get_refresh_interval()
     
@@ -1755,6 +2423,40 @@ async def download_album(chat_id, msg_id, download_path=None, progress_callback=
         if isinstance(m.media, (MessageMediaDocument, MessageMediaPhoto)):
             original_filename = m.file.name if hasattr(m, 'file') and m.file and m.file.name else f"file_{idx}"
             filename = f"{m.id}_{original_filename}"
+            expected_size = m.file.size if hasattr(m, 'file') and m.file else 0
+            
+            # 使用新的路径生成逻辑
+            if download_path:
+                # 如果指定了下载路径，直接使用
+                folder = download_path
+                os.makedirs(folder, exist_ok=True)
+                full_file_path = os.path.join(folder, filename)
+            else:
+                # 使用新的路径生成逻辑
+                full_file_path = get_download_path(chat_title, filename)
+                folder = os.path.dirname(full_file_path)
+                os.makedirs(folder, exist_ok=True)
+            
+            # 检查文件是否已存在且完整
+            file_exists, local_size = check_file_exists(full_file_path)
+            
+            if file_exists and local_size == expected_size and skip_existing and not force_redownload:
+                # 文件已完整下载，跳过
+                skipped_files.append(filename)
+                if progress_callback:
+                    await progress_callback(idx, total)
+                return
+            
+            if file_exists and not force_redownload and local_size != expected_size:
+                # 文件存在但大小不匹配，需要重新下载
+                print(f"[download_album] 文件大小不匹配，重新下载: {filename} ({local_size}/{expected_size})")
+            
+            if force_redownload and file_exists:
+                # 强制重新下载，删除现有文件
+                try:
+                    os.remove(full_file_path)
+                except Exception as e:
+                    print(f"[download_album] 删除现有文件失败: {e}")
             
             # 创建下载任务
             task_id = download_manager.add_task(chat_id, m.id, filename, user_id or 0)
