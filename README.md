@@ -73,6 +73,9 @@ docker-compose up -d
 ```bash
 docker-compose logs -f
 ```
+5. 登录 userbot
+
+使用浏览器打开 ip:8000 端口
 
 ### 手动部署
 
@@ -92,6 +95,10 @@ export BOT_TOKEN=你的_机器人_TOKEN
 ```bash
 python3 main.py
 ```
+
+4. 登录 userbot
+
+使用浏览器打开 ip:8000 端口
 
 ## 📖 使用指南
 
