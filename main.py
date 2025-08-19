@@ -44,11 +44,11 @@ def create_download_control_keyboard(task_id: str) -> InlineKeyboardMarkup:
     ])
     return keyboard
 
-def create_file_check_keyboard(chat_id: int, msg_id: int, user_id: int) -> InlineKeyboardMarkup:
+def create_file_check_keyboard(chat_id, msg_id: int, user_id: int) -> InlineKeyboardMarkup:
     """创建文件检查结果键盘"""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📥 下载缺失文件", callback_data=f"download_missing_{chat_id}_{msg_id}_{user_id}"),
+            InlineKeyboardButton(text="� 下续传下载", callback_data=f"download_missing_{chat_id}_{msg_id}_{user_id}"),
             InlineKeyboardButton(text="🔄 强制重下全部", callback_data=f"force_download_all_{chat_id}_{msg_id}_{user_id}")
         ]
     ])
@@ -320,6 +320,9 @@ def get_download_path(chat_title: str, file_name: str, use_classification: bool 
     else:
         return os.path.join(base_dir, safe_chat_title, file_name)
 
+# 消息ID缓存字典，用于避免重复检查
+_message_id_cache = {}
+
 # ====== 文件检查和断点续传工具函数 ======
 def check_file_exists(file_path: str) -> tuple[bool, int]:
     """
@@ -334,6 +337,50 @@ def check_file_exists(file_path: str) -> tuple[bool, int]:
         return False, 0
     except Exception:
         return False, 0
+
+def check_message_file_exists(folder_path: str, message_id: int, expected_size: int = 0) -> tuple[bool, str, int]:
+    """
+    检查目录中是否已存在指定消息ID的文件
+    
+    Args:
+        folder_path: 目标文件夹路径
+        message_id: 消息ID
+        expected_size: 期望文件大小（用于验证完整性）
+    
+    Returns:
+        (是否存在, 完整文件路径, 文件大小)
+    """
+    try:
+        if not os.path.exists(folder_path):
+            return False, "", 0
+        
+        # 查找以消息ID开头的文件
+        prefix = f"{message_id}_"
+        for filename in os.listdir(folder_path):
+            if filename.startswith(prefix):
+                file_path = os.path.join(folder_path, filename)
+                if os.path.isfile(file_path):
+                    file_size = os.path.getsize(file_path)
+                    print(f"[check_message_file_exists] 找到现有文件: {filename} ({file_size} bytes)")
+                    
+                    # 如果指定了期望大小，检查文件完整性
+                    if expected_size > 0:
+                        if file_size == expected_size:
+                            print(f"[check_message_file_exists] 文件完整: {filename}")
+                            return True, file_path, file_size
+                        else:
+                            print(f"[check_message_file_exists] 文件不完整: {filename} ({file_size}/{expected_size})")
+                            return True, file_path, file_size
+                    else:
+                        # 期望大小为0时，只要文件存在就认为完整
+                        print(f"[check_message_file_exists] 文件存在（期望大小为0）: {filename}")
+                        return True, file_path, file_size
+        
+        print(f"[check_message_file_exists] 未找到消息ID {message_id} 的文件")
+        return False, "", 0
+    except Exception as e:
+        print(f"[check_message_file_exists] 检查文件时出错: {e}")
+        return False, "", 0
 
 async def get_message_files_info(chat_id: int, msg_id: int) -> list[dict]:
     """
@@ -423,7 +470,8 @@ async def check_download_status(chat_id: int, msg_id: int, chat_title: str = Non
     
     for file_info in files_info:
         file_path = get_download_path(chat_title, file_info['file_name'])
-        exists, local_size = check_file_exists(file_path)
+        folder = os.path.dirname(file_path)
+        exists, existing_path, local_size = check_message_file_exists(folder, file_info['message_id'], file_info['file_size'])
         
         result['total_size'] += file_info['file_size']
         
@@ -433,7 +481,7 @@ async def check_download_status(chat_id: int, msg_id: int, chat_title: str = Non
             result['downloaded_size'] += local_size
             result['existing_files'].append({
                 **file_info,
-                'local_path': file_path,
+                'local_path': existing_path,
                 'local_size': local_size,
                 'status': 'complete'
             })
@@ -441,7 +489,7 @@ async def check_download_status(chat_id: int, msg_id: int, chat_title: str = Non
             # 文件部分下载
             result['missing_files'].append({
                 **file_info,
-                'local_path': file_path,
+                'local_path': existing_path,
                 'local_size': local_size,
                 'status': 'partial'
             })
@@ -660,7 +708,8 @@ BASIC_USER_HELP_TEMPLATE = """🤖 Telegram 下载机器人帮助
 • 所有下载均通过 userbot 进行
 • 下载的文件会按来源分类保存
 • 任务ID可通过 /downloads 命令获取
-• 发送链接时会自动检查文件状态"""
+• 发送链接时会自动检查文件状态
+• 只有不完整文件才会显示续传选项"""
 
 # ====== 设置显示格式化函数 ======
 def format_settings_display() -> str:
@@ -1523,34 +1572,51 @@ async def handle_link(message: types.Message):
             await status_msg.edit_text("❌ 消息中没有可下载的文件")
             return
         
-        # 格式化状态消息
-        status_text = format_download_status_message(download_status, chat_title)
+        # 分析文件状态
+        missing_files = [f for f in download_status['missing_files'] if f['status'] == 'missing']
+        partial_files = [f for f in download_status['missing_files'] if f['status'] == 'partial']
         
         if download_status['downloaded_files'] == download_status['total_files']:
             # 所有文件已下载完成
+            status_text = format_download_status_message(download_status, chat_title)
             await status_msg.edit_text(
                 status_text,
                 reply_markup=create_file_check_keyboard(chat_id, msg_id, user_id)
             )
-        elif len(download_status['missing_files']) > 0:
-            # 有文件需要下载
+        elif len(missing_files) > 0 and len(partial_files) == 0:
+            # 只有缺失文件，没有部分文件，直接开始下载
+            await status_msg.edit_text("📥 发现缺失文件，开始下载...")
+            
+            if msg.grouped_id:
+                files = await download_album(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id, skip_existing=True)
+            else:
+                files = await download_single_file(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id, skip_existing=True)
+            
+            if isinstance(files, list) and files:
+                # 计算新下载的文件和跳过的文件
+                new_files = [f for f in files if not f.startswith("✅")]
+                skipped_files = [f for f in files if f.startswith("✅")]
+                
+                if any('失败' in str(f) for f in files):
+                    await message.reply(f'⚠️ 部分下载失败: {len(new_files)} 个新文件, {len(skipped_files)} 个已存在文件被跳过')
+                else:
+                    await message.reply(f'✅ 下载完成: {len(new_files)} 个新文件, {len(skipped_files)} 个已存在文件被跳过')
+            else:
+                await message.reply(f'❌ 下载失败: {files if files else "未知错误"}')
+        elif len(partial_files) > 0:
+            # 有部分下载的文件，提示续传选项
+            status_text = format_download_status_message(download_status, chat_title)
             await status_msg.edit_text(
                 status_text,
                 reply_markup=create_file_check_keyboard(chat_id, msg_id, user_id)
             )
         else:
-            # 开始下载
-            await status_msg.edit_text("📥 开始下载...")
-            
-            if msg.grouped_id:
-                files = await download_album(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
-            else:
-                files = await download_single_file(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
-            
-            if isinstance(files, list) and files and not any('失败' in str(f) for f in files):
-                await message.reply(f'✅ 下载完成: {len(files)} 个文件')
-            else:
-                await message.reply(f'❌ 下载失败: {files if files else "未知错误"}')
+            # 其他情况，显示状态和选项
+            status_text = format_download_status_message(download_status, chat_title)
+            await status_msg.edit_text(
+                status_text,
+                reply_markup=create_file_check_keyboard(chat_id, msg_id, user_id)
+            )
     
     except Exception as e:
         await status_msg.edit_text(f"❌ 检查文件状态时出错: {str(e)}")
@@ -1672,7 +1738,7 @@ async def handle_file(message: types.Message):
             # 用 userbot 下载文件
             await download_manager.run(userbot.download_media(
                 await userbot.get_messages(message.chat.id, ids=message.message_id), 
-                file=folder, 
+                file=file_path, 
                 progress_callback=progress_with_task_control
             ))
             task.status = "completed"
@@ -1826,11 +1892,17 @@ async def handle_download_callback(callback_query: types.CallbackQuery, data: st
         if data.startswith("download_missing_"):
             # 解析参数: download_missing_{chat_id}_{msg_id}_{user_id}
             parts = data.split("_")
-            if len(parts) != 5:
+            if len(parts) < 5:
                 await callback_query.answer("❌ 参数错误", show_alert=True)
                 return
             
-            chat_id = int(parts[2])
+            # chat_id 可能是字符串（公开频道）或数字（私密频道）
+            chat_id_str = parts[2]
+            try:
+                chat_id = int(chat_id_str)
+            except ValueError:
+                chat_id = chat_id_str
+            
             msg_id = int(parts[3])
             original_user_id = int(parts[4])
             
@@ -1839,8 +1911,8 @@ async def handle_download_callback(callback_query: types.CallbackQuery, data: st
                 await callback_query.answer("❌ 您只能操作自己的下载任务", show_alert=True)
                 return
             
-            await callback_query.answer("📥 开始下载缺失文件...")
-            await callback_query.message.edit_text("📥 正在下载缺失的文件，请稍候...")
+            await callback_query.answer("�  开始续传下载...")
+            await callback_query.message.edit_text("� 正在在续传下载，请稍候...")
             
             # 获取下载状态
             chat_title = await get_chat_info(chat_id)
@@ -1890,11 +1962,17 @@ async def handle_download_callback(callback_query: types.CallbackQuery, data: st
         elif data.startswith("force_download_all_"):
             # 解析参数: force_download_all_{chat_id}_{msg_id}_{user_id}
             parts = data.split("_")
-            if len(parts) != 6:
+            if len(parts) < 6:
                 await callback_query.answer("❌ 参数错误", show_alert=True)
                 return
             
-            chat_id = int(parts[3])
+            # chat_id 可能是字符串（公开频道）或数字（私密频道）
+            chat_id_str = parts[3]
+            try:
+                chat_id = int(chat_id_str)
+            except ValueError:
+                chat_id = chat_id_str
+            
             msg_id = int(parts[4])
             original_user_id = int(parts[5])
             
@@ -2274,6 +2352,11 @@ async def download_single_file(chat_id, msg_id, download_path=None, progress_cal
     filename = f"{msg.id}_{original_filename}"
     expected_size = msg.file.size if hasattr(msg, 'file') and msg.file else 0
     
+    # 调试日志
+    print(f"[download_single_file] 文件信息: {filename}")
+    print(f"[download_single_file] 期望大小: {expected_size} bytes")
+    print(f"[download_single_file] 参数 - skip_existing: {skip_existing}, force_redownload: {force_redownload}")
+    
     # 使用新的路径生成逻辑
     if download_path:
         # 如果指定了下载路径，直接使用
@@ -2287,19 +2370,63 @@ async def download_single_file(chat_id, msg_id, download_path=None, progress_cal
         folder = os.path.dirname(full_file_path)
         os.makedirs(folder, exist_ok=True)
     
-    # 检查文件是否已存在且完整
-    file_exists, local_size = check_file_exists(full_file_path)
+    # 使用消息ID检查目录中是否已存在相同消息的文件
+    existing_file_found, existing_file_path, existing_file_size = check_message_file_exists(folder, msg.id, expected_size)
     
-    if file_exists and local_size == expected_size and skip_existing and not force_redownload:
-        # 文件已完整下载，跳过
-        return [f'✅ 文件已存在且完整，跳过下载: {filename}']
+    # 调试日志
+    print(f"[download_single_file] 目标文件夹: {folder}")
+    print(f"[download_single_file] 消息ID: {msg.id}")
+    print(f"[download_single_file] 找到现有文件: {existing_file_found}")
+    if existing_file_found:
+        print(f"[download_single_file] 现有文件路径: {existing_file_path}")
+        print(f"[download_single_file] 现有文件大小: {existing_file_size} bytes")
     
-    if file_exists and not force_redownload:
-        # 文件存在但可能不完整，提示用户
-        if local_size < expected_size:
-            return [f'⚠️ 文件部分下载 ({local_size}/{expected_size} bytes)，使用强制重下载完整文件: {filename}']
-        elif local_size > expected_size:
-            return [f'⚠️ 本地文件大小异常 ({local_size}/{expected_size} bytes)，建议强制重下: {filename}']
+    # 如果找到现有文件且应该跳过
+    if existing_file_found and skip_existing and not force_redownload:
+        if expected_size == 0:
+            # 期望大小为 0 时，只要文件存在就跳过
+            print(f"[download_single_file] 期望大小为 0，跳过现有文件")
+            return [f'✅ 消息 {msg.id} 的文件已存在，跳过下载: {os.path.basename(existing_file_path)}']
+        elif existing_file_size == expected_size:
+            # 文件大小匹配，跳过下载
+            print(f"[download_single_file] 文件完整，跳过下载")
+            return [f'✅ 消息 {msg.id} 的文件已存在且完整，跳过下载: {os.path.basename(existing_file_path)}']
+        else:
+            # 文件不完整，继续下载但可能需要删除现有文件
+            print(f"[download_single_file] 文件不完整，将重新下载")
+            if existing_file_path != full_file_path:
+                # 如果现有文件路径与目标路径不同，删除现有文件
+                try:
+                    os.remove(existing_file_path)
+                    print(f"[download_single_file] 删除不完整的现有文件: {existing_file_path}")
+                except Exception as e:
+                    print(f"[download_single_file] 删除现有文件失败: {e}")
+    
+    # 如果强制重新下载且找到现有文件，删除它
+    if force_redownload and existing_file_found:
+        try:
+            os.remove(existing_file_path)
+            print(f"[download_single_file] 强制重下载，删除现有文件: {existing_file_path}")
+        except Exception as e:
+            print(f"[download_single_file] 删除现有文件失败: {e}")
+    
+    # 检查目标文件是否存在（使用文件路径检查，因为我们已经确定了具体的文件路径）
+    folder = os.path.dirname(full_file_path)
+    file_exists, existing_path, local_size = check_message_file_exists(folder, msg.id, expected_size)
+    
+    # 如果强制重新下载，删除现有文件
+    if force_redownload and file_exists:
+        try:
+            os.remove(existing_path)
+            print(f"[download_single_file] 删除现有文件进行强制重下: {os.path.basename(existing_path)}")
+            file_exists = False
+            local_size = 0
+        except Exception as e:
+            print(f"[download_single_file] 删除现有文件失败: {e}")
+    
+    # 如果文件存在但不完整，继续下载（断点续传）
+    if file_exists and local_size != expected_size and not force_redownload:
+        print(f"[download_single_file] 检测到不完整文件，继续下载: {os.path.basename(existing_path)} ({local_size}/{expected_size} bytes)")
     
     saved_files = []
     refresh_interval = get_refresh_interval()
@@ -2366,9 +2493,19 @@ async def download_single_file(chat_id, msg_id, download_path=None, progress_cal
             except Exception as e:
                 print(f"[progress] edit_message_text error: {e}")
     
+    # 最后一次检查：在实际下载前再次确认文件状态（使用消息ID检查）
+    final_existing_found, final_existing_path, final_existing_size = check_message_file_exists(folder, msg.id, expected_size)
+    if final_existing_found and skip_existing and not force_redownload:
+        if expected_size == 0 or final_existing_size == expected_size:
+            print(f"[download_single_file] 最终检查: 消息 {msg.id} 的文件已完整，取消下载任务")
+            task.status = "completed"
+            download_manager.remove_completed_task(task_id)
+            return [f'✅ 消息 {msg.id} 的文件已存在且完整，跳过下载: {os.path.basename(final_existing_path)}']
+    
+    print(f"[download_single_file] 开始实际下载: {filename}")
     try:
         file = await download_manager.run(
-            userbot.download_media(msg, file=folder, progress_callback=progress_with_task_control)
+            userbot.download_media(msg, file=full_file_path, progress_callback=progress_with_task_control)
         )
         saved_files.append(file)
         task.status = "completed"
@@ -2437,24 +2574,69 @@ async def download_album(chat_id, msg_id, download_path=None, progress_callback=
                 folder = os.path.dirname(full_file_path)
                 os.makedirs(folder, exist_ok=True)
             
-            # 检查文件是否已存在且完整
-            file_exists, local_size = check_file_exists(full_file_path)
+            # 调试日志
+            print(f"[download_album] 文件信息: {filename}")
+            print(f"[download_album] 期望大小: {expected_size} bytes")
+            print(f"[download_album] 目标文件夹: {folder}")
             
-            if file_exists and local_size == expected_size and skip_existing and not force_redownload:
-                # 文件已完整下载，跳过
-                skipped_files.append(filename)
-                if progress_callback:
-                    await progress_callback(idx, total)
-                return
+            # 使用消息ID检查目录中是否已存在相同消息的文件
+            existing_file_found, existing_file_path, existing_file_size = check_message_file_exists(folder, m.id, expected_size)
+            
+            print(f"[download_album] 消息ID: {m.id}")
+            print(f"[download_album] 找到现有文件: {existing_file_found}")
+            if existing_file_found:
+                print(f"[download_album] 现有文件路径: {existing_file_path}")
+                print(f"[download_album] 现有文件大小: {existing_file_size} bytes")
+            
+            # 如果找到现有文件且应该跳过
+            if existing_file_found and skip_existing and not force_redownload:
+                if expected_size == 0:
+                    # 期望大小为 0 时，只要文件存在就跳过
+                    print(f"[download_album] 期望大小为 0，跳过现有文件")
+                    skipped_files.append(os.path.basename(existing_file_path))
+                    if progress_callback:
+                        await progress_callback(idx, total)
+                    return
+                elif existing_file_size == expected_size:
+                    # 文件大小匹配，跳过下载
+                    print(f"[download_album] 文件完整，跳过下载")
+                    skipped_files.append(os.path.basename(existing_file_path))
+                    if progress_callback:
+                        await progress_callback(idx, total)
+                    return
+                else:
+                    # 文件不完整，继续下载但可能需要删除现有文件
+                    print(f"[download_album] 文件不完整，将重新下载")
+                    if existing_file_path != full_file_path:
+                        # 如果现有文件路径与目标路径不同，删除现有文件
+                        try:
+                            os.remove(existing_file_path)
+                            print(f"[download_album] 删除不完整的现有文件: {existing_file_path}")
+                        except Exception as e:
+                            print(f"[download_album] 删除现有文件失败: {e}")
+            
+            # 如果强制重新下载且找到现有文件，删除它
+            if force_redownload and existing_file_found:
+                try:
+                    os.remove(existing_file_path)
+                    print(f"[download_album] 强制重下载，删除现有文件: {existing_file_path}")
+                except Exception as e:
+                    print(f"[download_album] 删除现有文件失败: {e}")
+            
+            # 检查目标文件是否存在
+            folder = os.path.dirname(full_file_path)
+            file_exists, existing_path, local_size = check_message_file_exists(folder, m.id, expected_size)
             
             if file_exists and not force_redownload and local_size != expected_size:
                 # 文件存在但大小不匹配，需要重新下载
-                print(f"[download_album] 文件大小不匹配，重新下载: {filename} ({local_size}/{expected_size})")
+                print(f"[download_album] 文件大小不匹配，重新下载: {os.path.basename(existing_path)} ({local_size}/{expected_size})")
             
             if force_redownload and file_exists:
                 # 强制重新下载，删除现有文件
                 try:
-                    os.remove(full_file_path)
+                    os.remove(existing_path)
+                    file_exists = False
+                    local_size = 0
                 except Exception as e:
                     print(f"[download_album] 删除现有文件失败: {e}")
             
@@ -2520,8 +2702,21 @@ async def download_album(chat_id, msg_id, download_path=None, progress_callback=
                     except Exception as e:
                         print(f"[progress] edit_message_text error: {e}")
             
+            # 最后一次检查：在实际下载前再次确认文件状态（使用消息ID检查）
+            final_existing_found, final_existing_path, final_existing_size = check_message_file_exists(folder, m.id, expected_size)
+            if final_existing_found and skip_existing and not force_redownload:
+                if expected_size == 0 or final_existing_size == expected_size:
+                    print(f"[download_album] 最终检查: 消息 {m.id} 的文件已完整，跳过下载")
+                    task.status = "completed"
+                    skipped_files.append(os.path.basename(final_existing_path))
+                    download_manager.remove_completed_task(task_id)
+                    if progress_callback:
+                        await progress_callback(idx, total)
+                    return
+            
+            print(f"[download_album] 开始实际下载: {filename}")
             try:
-                file = await userbot.download_media(m, file=folder, progress_callback=progress_with_task_control)
+                file = await userbot.download_media(m, file=full_file_path, progress_callback=progress_with_task_control)
                 saved_files.append(file)
                 task.status = "completed"
                 if sent_msg:
