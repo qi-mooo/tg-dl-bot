@@ -1084,11 +1084,25 @@ async def handle_link(message: types.Message):
         await message.reply('请发送有效的 Telegram 消息链接。')
         return
     user_id = message.from_user.id
-    files = await download_album(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
-    if isinstance(files, list):
+    
+    # 首先检查消息类型
+    await ensure_userbot()
+    msg = await userbot.get_messages(chat_id, ids=msg_id)
+    if not msg:
+        await message.reply('未找到消息')
+        return
+    
+    # 如果是相册消息，使用相册下载
+    if msg.grouped_id:
+        files = await download_album(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
+    else:
+        # 如果不是相册，直接下载单个文件
+        files = await download_single_file(chat_id, msg_id, bot_chat_id=message.chat.id, user_id=user_id)
+    
+    if isinstance(files, list) and files and not any('失败' in str(f) for f in files):
         await message.reply(f'下载完成: {files}')
     else:
-        await message.reply('下载失败。')
+        await message.reply(f'下载失败: {files if files else "未知错误"}')
 
 async def handle_file(message: types.Message):
     await ensure_userbot()
@@ -1500,11 +1514,119 @@ async def get_chat_folder(chat_id):
     os.makedirs(folder, exist_ok=True)
     return folder
 
+async def download_single_file(chat_id, msg_id, download_path=None, progress_callback=None, bot_chat_id=None, user_id=None):
+    """下载单个文件（非相册）"""
+    await ensure_userbot()
+    msg = await userbot.get_messages(chat_id, ids=msg_id)
+    if not msg:
+        return ['未找到消息']
+    
+    # 检查消息是否包含媒体文件
+    if not isinstance(msg.media, (MessageMediaDocument, MessageMediaPhoto)):
+        return ['消息不包含可下载的文件']
+    
+    folder = download_path or await get_chat_folder(chat_id)
+    saved_files = []
+    refresh_interval = get_refresh_interval()
+    
+    filename = msg.file.name if hasattr(msg, 'file') and msg.file and msg.file.name else f"file_{msg.id}"
+    
+    # 创建下载任务
+    task_id = download_manager.add_task(chat_id, msg.id, filename, user_id or 0)
+    task = download_manager.get_task(task_id)
+    
+    sent_msg = None
+    last_update = 0
+    start_time = time.time()
+    last_bytes = [0]
+    
+    async def progress_with_task_control(current, total_bytes):
+        nonlocal sent_msg, last_update, start_time, last_bytes
+        
+        # 检查任务是否被取消
+        if task.cancel_event.is_set():
+            task.status = "cancelled"
+            if sent_msg:
+                await bot.edit_message_text(
+                    chat_id=sent_msg.chat.id, 
+                    message_id=sent_msg.message_id, 
+                    text=f"❌ 下载已取消: {filename}"
+                )
+            download_manager.remove_completed_task(task_id)
+            raise asyncio.CancelledError("下载任务已取消")
+        
+        # 等待暂停事件
+        await task.pause_event.wait()
+        
+        # 更新任务进度信息
+        now = time.time()
+        task.progress = current / total_bytes if total_bytes else 0
+        task.total_size = total_bytes
+        task.current_size = current
+        task.speed = (current - last_bytes[0]) / (now - last_update + 1e-6) if now > last_update else 0
+        
+        percent = int(current * 100 / total_bytes) if total_bytes else 0
+        speed_str = f"{task.speed/1024/1024:.2f}MB/s" if task.speed > 1024*1024 else f"{task.speed/1024:.2f}KB/s"
+        
+        status_emoji = "⏬" if task.status == "running" else "⏸️"
+        text = f"{status_emoji} {filename}: {percent}% | {current/1024/1024:.2f}MB/{total_bytes/1024/1024:.2f}MB | 速度: {speed_str}"
+        
+        # 首次、每 refresh_interval 秒、或完成时都刷新
+        if not sent_msg:
+            sent_msg = await bot.send_message(
+                bot_chat_id,
+                f"⏬ 正在下载 {filename}: 0% | 0.00MB/{total_bytes/1024/1024:.2f}MB (ID: {task_id})"
+            )
+            last_update = now
+            last_bytes[0] = current
+        elif now - last_update >= refresh_interval or current == total_bytes:
+            try:
+                await bot.edit_message_text(chat_id=sent_msg.chat.id, message_id=sent_msg.message_id, text=text)
+                last_update = now
+                last_bytes[0] = current
+            except Exception as e:
+                print(f"[progress] edit_message_text error: {e}")
+    
+    try:
+        file = await download_manager.run(
+            userbot.download_media(msg, file=folder, progress_callback=progress_with_task_control)
+        )
+        saved_files.append(file)
+        task.status = "completed"
+        if sent_msg:
+            await bot.edit_message_text(
+                chat_id=sent_msg.chat.id, 
+                message_id=sent_msg.message_id, 
+                text=f"✅ 下载完成: {filename}"
+            )
+        if progress_callback:
+            await progress_callback(1, 1)
+    except asyncio.CancelledError:
+        # 任务被取消，不需要额外处理
+        pass
+    except Exception as e:
+        task.status = "failed"
+        if sent_msg:
+            await bot.edit_message_text(
+                chat_id=sent_msg.chat.id, 
+                message_id=sent_msg.message_id, 
+                text=f"💥 下载失败: {filename} - {str(e)}"
+            )
+        print(f"[download_single_file] error: {e}")
+        return [f'下载失败: {str(e)}']
+    finally:
+        # 清理已完成的任务
+        download_manager.remove_completed_task(task_id)
+    
+    return saved_files
+
 async def download_album(chat_id, msg_id, download_path=None, progress_callback=None, bot_chat_id=None, user_id=None):
     await ensure_userbot()
     msg = await userbot.get_messages(chat_id, ids=msg_id)
-    if not msg or not msg.grouped_id:
-        return ['未找到相册或消息不是相册']
+    if not msg:
+        return ['未找到消息']
+    if not msg.grouped_id:
+        return ['消息不是相册']
     # 获取同一 grouped_id 的所有消息
     all_msgs = await userbot.get_messages(chat_id, limit=50, min_id=msg.id-25, max_id=msg.id+25)
     album = [m for m in all_msgs if getattr(m, 'grouped_id', None) == msg.grouped_id]
