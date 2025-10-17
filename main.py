@@ -2543,6 +2543,9 @@ async def cmd_addmonitor(message: types.Message):
             await rate_limiter.send_message(message.chat.id, "❌ 请提供至少一个关键词")
             return
         
+        # 确保 userbot 已连接
+        await ensure_userbot()
+        
         # 获取频道信息
         try:
             entity = await userbot.get_entity(chat_identifier)
@@ -2589,6 +2592,9 @@ async def cmd_removemonitor(message: types.Message):
             return
         
         chat_identifier = parts[1].strip()
+        
+        # 确保 userbot 已连接
+        await ensure_userbot()
         
         # 获取频道信息
         try:
@@ -2671,6 +2677,9 @@ async def cmd_togglemonitor(message: types.Message):
             return
         
         chat_identifier = parts[1].strip()
+        
+        # 确保 userbot 已连接
+        await ensure_userbot()
         
         # 获取频道信息
         try:
